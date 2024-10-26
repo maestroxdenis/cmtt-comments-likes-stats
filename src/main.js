@@ -8,9 +8,11 @@ const REQUEST_COMMENT_ETA  = 100;   // время выполнения запр�
 const USER_REGEX           = /(https\:\/\/)?(dtf\.ru|vc\.ru|tjournal\.ru)\/u\/(\d+)/;
 
 const queue = new Queue({period: REQUESTS_DELAY});
+let authToken = null;
+let expires = null;
 
-function getBaseUrl(site) {
-    return `https://api.${site}/v2.31/`
+function getBaseUrl(site, version = '2.5') {
+    return `https://api.${site}/v${version}/` // 2.31 doesn't return lastId and lastSorting, but 2.5 doesn't contain total comments counter(always=1)
 }
 
 function getCommentLikes(site, id, cookieKey) {
@@ -28,6 +30,40 @@ function getCommentLikes(site, id, cookieKey) {
     };
 }
 
+function getCommentReactions(site, id, refreshToken) {
+    return {
+        run: async () => 
+        {
+            
+            if(!isTimestampValid(expires))
+            {
+                try {
+                    let data = { token: refreshToken }
+                    let response = await fetch(`https://localhost:6005/token`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(data)
+                    })
+                    let tokenResponse = await response.json()
+                    if(tokenResponse){
+                        authToken = tokenResponse.token
+                        expires = tokenResponse.expires
+                    }
+                }
+                catch(e) {
+                    console.error('failed to get token from refresh token. ' + e);
+                }
+            }
+            return fetch(`${getBaseUrl(site)}comment/${id}/reactions`, {
+            headers: {
+                jwtauthorization: `Bearer ${authToken}`
+            }})
+        }
+    }
+}
+
 function getCommentsChunk(site, id, lastId, lastSorting) {
     return {
         run: async () => fetch(`${getBaseUrl(site)}comments?subsiteId=${id}&sorting=date${lastId ? (`&lastId=${lastId}&lastSortingValue=${lastSorting}`) : ''}`)
@@ -36,20 +72,49 @@ function getCommentsChunk(site, id, lastId, lastSorting) {
 
 function getProfile(site, id) {
     return {
-        run: async () => fetch(`${getBaseUrl(site)}subsite?id=${id}`)
+        run: async () => fetch(`${getBaseUrl(site, '2.31')}subsite?id=${id}`)
     };
 }
 
-function loadLikes(site, comments, cookieKey, onLikesProgress, onComplete) {
+function getToken(site, refreshToken) {
+    let data = { token: refreshToken }
+    return {
+        run: async () => fetch(`https://localhost:6005/token`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(data)
+        })
+    };
+}
+
+async function loadLikes(site, comments, cookieKey, tokenKey, onLikesProgress, onComplete) {
     const errors     = [];
     const users      = {};
     const totalCount = comments.length;
     let counted      = 0;
     let likes        = 0;
     let dislikes     = 0;
+    if(tokenKey){
+        try {
+        const tokenResponse = await queue.addTask(getToken(site, tokenKey))
+           if(tokenResponse){
+              authToken = tokenResponse.token
+              expires = tokenResponse.expires
+           }
+        }
+        catch(e) {
+            console.error('failed to get token from refresh token. ' + e);
+        }
+    }
 
     for (const comment of comments) {
-        queue.addTask(getCommentLikes(site, comment.id, cookieKey))
+        processComment(comment)
+    }
+
+    function processComment(comment, doRetry = true){
+        queue.addTask(tokenKey ? getCommentReactions(site, comment.id, tokenKey) : getCommentLikes(site, comment.id, cookieKey))
             .then(commentLikers => {
                 if (cookieKey) {
                     // запрос с куками не будет из браузера работать
@@ -79,23 +144,49 @@ function loadLikes(site, comments, cookieKey, onLikesProgress, onComplete) {
                         }
                     }
                 } else {
-                    if (commentLikers && commentLikers.result) {
-                        for (const liker of commentLikers.result) {
-                            if (!users[liker.id])
-                                users[liker.id] = {
-                                    id:       liker.id,
-                                    likes:    0,
-                                    dislikes: 0,
-                                    ava:      getAva(liker.avatar),
-                                    name:     liker.name
+                    if(tokenKey){
+                        if(commentLikers && commentLikers.result.reactions){
+                            for (const reaction of commentLikers.result.reactions) {
+                                let liker = reaction.user
+                                if (!users[liker.id])
+                                    users[liker.id] = {
+                                        id:       liker.id,
+                                        likes:    0,
+                                        dislikes: 0,
+                                        ava:      getAva(liker.avatar),
+                                        name:     liker.name
+                                    }
+    
+                                if (liker.type === 1) {
+                                    users[liker.id].likes++;
+                                    likes++;
+                                } else {
+                                    users[liker.id].dislikes++;
+                                    dislikes++;
                                 }
-
-                            if (liker.type === 1) {
-                                users[liker.id].likes++;
-                                likes++;
-                            } else {
-                                users[liker.id].dislikes++;
-                                dislikes++;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        if (commentLikers && commentLikers.result) {
+                            for (const liker of commentLikers.result) {
+                                if (!users[liker.id])
+                                    users[liker.id] = {
+                                        id:       liker.id,
+                                        likes:    0,
+                                        dislikes: 0,
+                                        ava:      getAva(liker.avatar),
+                                        name:     liker.name
+                                    }
+    
+                                if (liker.type === 1) {
+                                    users[liker.id].likes++;
+                                    likes++;
+                                } else {
+                                    users[liker.id].dislikes++;
+                                    dislikes++;
+                                }
                             }
                         }
                     }
@@ -117,14 +208,33 @@ function loadLikes(site, comments, cookieKey, onLikesProgress, onComplete) {
                 }
             })
             .catch(e => {
+                if(doRetry && e.data.code == 401) {
+                    processComment(comment, false)
+                }
+                else {
                 console.error('loadLikes: ', e);
                 ++counted
                 errors.push({id: comment.id});
+                }
             });
     }
 }
 
-async function getCommentsLikes(site, id, cookieKey, onCommentsProgress, onLikesProgress, onComplete) {
+function isTimestampValid(expireTimestamp) {
+    // Convert Unix timestamp in seconds to milliseconds
+    const timestampMilliseconds = expireTimestamp * 1000;
+    
+    // Get current timestamp in milliseconds
+    const currentTimestamp = Date.now();
+    
+    // Compute the timestamp for 10 minutes ago
+    const tenMinutesAgo = currentTimestamp + (10 * 60 * 1000); // 10 minutes * 60 seconds * 1000 milliseconds
+    
+    // Check if the given timestamp is not expired (i.e., it is greater than or equal to ten minutes ago)
+    return timestampMilliseconds >= tenMinutesAgo;
+}
+
+async function getCommentsLikes(site, id, cookieKey, tokenKey, onCommentsProgress, onLikesProgress, onComplete) {
     let loadedItemsCount = 0;
     const totalComments  = [];
     let lastId           = undefined;
@@ -132,7 +242,6 @@ async function getCommentsLikes(site, id, cookieKey, onCommentsProgress, onLikes
     do {
         try {
             const comments = await queue.addTask(getCommentsChunk(site, id, lastId, lastSortingValue));
-
             // no items, just leave
             if (!comments || !comments.result || !comments.result.items || !comments.result.items.length)
                 break;
@@ -141,7 +250,7 @@ async function getCommentsLikes(site, id, cookieKey, onCommentsProgress, onLikes
             lastId           = comments.result.lastId;
             lastSortingValue = comments.result.lastSortingValue;
 
-            totalComments.push(...items.filter(cmt => cmt.likes.counter).map(cmt => {
+            totalComments.push(...items.filter(cmt => cmt.likes.counterLikes).map(cmt => {
                 return {
                     id: cmt.id
                 };
@@ -159,7 +268,7 @@ async function getCommentsLikes(site, id, cookieKey, onCommentsProgress, onLikes
 
     } while (true);
 
-    loadLikes(site, totalComments, cookieKey, onLikesProgress, onComplete);
+    await loadLikes(site, totalComments, cookieKey, tokenKey, onLikesProgress, onComplete);
 }
 
 function formatTime(secs) {
@@ -316,7 +425,7 @@ function fillProfileInfo(profile) {
     comments.innerText = `Комментариев: ${profile.counters.comments}`;
 }
 
-async function getInfo(site, id, profile, cookieKey) {
+async function getInfo(site, id, profile, cookieKey, tokenKey) {
     const totalCommentsText          = document.getElementById('card-comments-progress-total');
     const countedCommentsText        = document.getElementById('card-comments-progress-counted');
     const countedCommentsProgressBar = document.getElementById('card-comments-progress-bar');
@@ -336,7 +445,7 @@ async function getInfo(site, id, profile, cookieKey) {
     const totalComments  = document.getElementById('total-comments');
     const parsedComments = document.getElementById('parsed-comments');
 
-    return getCommentsLikes(site, id, cookieKey, (loadedItemsCount) => {
+    return getCommentsLikes(site, id, cookieKey, tokenKey, (loadedItemsCount) => {
         if (profile) {
             loadedItemsCount           = Math.min(loadedItemsCount, profile.counters.comments);
             const totalCommentsSeconds = (profile.counters.comments - loadedItemsCount) / COMMENTS_PER_REQUEST * (REQUESTS_DELAY + REQUEST_COMMENTS_ETA) / 1000;
@@ -370,7 +479,8 @@ async function getInfo(site, id, profile, cookieKey) {
 export function onClicked() {
     const errorText = document.getElementById('error');
     const urlText   = document.getElementById('search-input');
-    const cookieKey = document.getElementById('search-cookie');
+    const cookieKey = null;
+    const tokenKey = document.getElementById('search-cookie');
 
     queue.clear();
     queue.start();
@@ -390,7 +500,7 @@ export function onClicked() {
         .then(profile => {
             fillProfileInfo(profile.result.subsite);
 
-            return getInfo(site, id, profile.result.subsite, cookieKey ? cookieKey.value : null);
+            return getInfo(site, id, profile.result.subsite, cookieKey ? cookieKey.value : null, tokenKey ? tokenKey.value : null);
         })
         .catch(e => {
             console.error(e);

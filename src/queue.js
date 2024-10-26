@@ -54,11 +54,16 @@ export class Queue {
 
                 return response.json();
             } catch (e) {
-                this.state = QueueState.Retrying;
                 lastError  = e;
+                if(e.data.code == 401){ // if not authorized don't retry
+                    tries = RETRIES;
+                }
+                else {
+                this.state = QueueState.Retrying;
 
                 await this.delay(DELAY_ON_ERROR);
                 tries++;
+                }
             }
         }
 

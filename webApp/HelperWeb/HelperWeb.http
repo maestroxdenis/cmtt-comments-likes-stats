@@ -1,0 +1,6 @@
+@HelperWeb_HostAddress = http://localhost:5069
+
+GET {{HelperWeb_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
