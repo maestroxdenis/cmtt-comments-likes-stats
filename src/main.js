@@ -9,8 +9,8 @@ const USER_REGEX           = /(https\:\/\/)?(dtf\.ru|vc\.ru|tjournal\.ru)\/u\/(\
 
 const queue = new Queue({period: REQUESTS_DELAY});
 
-function getBaseUrl(site) {
-    return `https://api.${site}/v2.31/`
+function getBaseUrl(site, version = '2.5') {
+    return `https://api.${site}/v${version}/` // 2.31 doesn't return lastId and lastSorting so update to 2.5, but 2.5 doesn't contain total comments counter(always=1) so keep 2.31 for others
 }
 
 function getCommentLikes(site, id, cookieKey) {
@@ -36,7 +36,7 @@ function getCommentsChunk(site, id, lastId, lastSorting) {
 
 function getProfile(site, id) {
     return {
-        run: async () => fetch(`${getBaseUrl(site)}subsite?id=${id}`)
+        run: async () => fetch(`${getBaseUrl(site, '2.31')}subsite?id=${id}`)
     };
 }
 
@@ -141,7 +141,7 @@ async function getCommentsLikes(site, id, cookieKey, onCommentsProgress, onLikes
             lastId           = comments.result.lastId;
             lastSortingValue = comments.result.lastSortingValue;
 
-            totalComments.push(...items.filter(cmt => cmt.likes.counter).map(cmt => {
+            totalComments.push(...items.filter(cmt => cmt.likes.counterLikes).map(cmt => {
                 return {
                     id: cmt.id
                 };
